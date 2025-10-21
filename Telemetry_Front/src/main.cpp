@@ -1,268 +1,580 @@
+// 172.20.10.4 pe iPhone
+bool vb = false; // Set to 'false' to disable all Serial output
+
+
 #include <Arduino.h>
 #include "ArduinoLog.h"
 #include "adcObj/adcObj.hpp"
 #include "driver/can.h"
 #include <TinyGPS++.h>
-#include "Aditional/aditional.hpp"
+#include "aditional/aditional.hpp"
 #include <HardwareSerial.h>
-#include <Arduino.h>
-//#include "MPU6050/MPU6050.h"
 #include "MPU9250/MPU9250c.hpp"
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <Wire.h>
 
 
-#define TX_GPIO_NUM   GPIO_NUM_14 //inversate??
-#define RX_GPIO_NUM   GPIO_NUM_27
-#define LOG_LEVEL LOG_LEVEL_ERROR
-#define GPS_BAUDRATE 9600 
+// Configuration Constants
+#define TX_GPIO_NUM GPIO_NUM_32
+#define RX_GPIO_NUM GPIO_NUM_26
 
-MPU9250c MPU;
-u_int16_t status;
-adcObj steeringAngle(ADC1_CHANNEL_7);
-adcObj damperLeftFront(ADC1_CHANNEL_4);
-adcObj damperRightFront(ADC1_CHANNEL_5);
 
-int latitude = 0;
-int longitude = 0;
-int speed = 0;
+#define GPS_RX_PIN GPIO_NUM_5
+#define GPS_TX_PIN GPIO_NUM_4
 
-int dleft;
-int dright;
-int dsteeringAngle;
 
-float roll;
-float pitch;
-float yaw;
+#define LOG_LEVEL LOG_LEVEL_ERROR // ArduinoLog level will still be respected
+#define GPS_BAUDRATE 9600
+#define TELEMETRY_INTERVAL_MS 100
+#define CAN_TIMEOUT_MS 0
+#define MAX_CAN_RESTART_ATTEMPTS 3
+#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define MPU_SDA_PIN 21
+#define MPU_SCL_PIN 22
+#define MPU9250_ADDRESS 0x68
 
-float gx;
-float gy;
-float gz;
 
-float ax;
-float ay;
-float az;
+// CAN Message IDs
+#define CAN_ID_ADC 0x116
+#define CAN_ID_GPS 0x117
+#define CAN_ID_MPU_ACCEL 0x118
+#define CAN_ID_MPU_GYRO 0x119
 
+
+// Global Objects
+MPU9250 mpu(Wire, MPU9250_ADDRESS);
+//adcObj steeringAngle(ADC1_CHANNEL_6);
+//adcObj damperLeftFront(ADC2_CHANNEL_8);
+//adcObj damperRightFront(ADC1_CHANNEL_5);
 TinyGPSPlus gps;
 
-twai_message_t tx_msg_mpu;
-twai_message_t tx_msg_gps;
-twai_message_t tx_msg_adc;
-twai_message_t tx_msg_gyro;
-twai_message_t tx_msg_acc;
 
-static const can_general_config_t g_config = {
-  .mode = TWAI_MODE_NO_ACK,
-  .tx_io = TX_GPIO_NUM,
-  .rx_io = RX_GPIO_NUM,
-  .clkout_io = TWAI_IO_UNUSED,
-  .bus_off_io = TWAI_IO_UNUSED,
-  .tx_queue_len = 1000,
-  .rx_queue_len = 5,
-  .alerts_enabled = TWAI_ALERT_ALL,
-  .clkout_divider = 0,
-  .intr_flags = ESP_INTR_FLAG_LEVEL1
-};
+// Sensor Data Structure
+struct SensorData {
+ // ADC values
+ uint16_t steeringAngleVoltage;
+ uint16_t damperLeftVoltage;
+ uint16_t damperRightVoltage;
 
-static const can_timing_config_t t_config = CAN_TIMING_CONFIG_500KBITS();
-static const can_filter_config_t f_config = CAN_FILTER_CONFIG_ACCEPT_ALL();
+
+ // IMU data (accelerometer and gyroscope)
+ float accelX, accelY, accelZ;
+ float gyroX, gyroY, gyroZ;
+
+
+ // GPS data
+ double latitude, longitude;
+ float speedKmh;
+ bool gpsValid;
+} sensorData;
+
+
+// CAN Messages
+twai_message_t canMessages[5]; // Index 0 unused, 1:ADC, 2:GPS, 3:ACCEL, 4:GYRO
+
+
+// Timing variables
+unsigned long lastTelemetryTime = 0;
+uint8_t canRestartAttempts = 0;
+bool canDriverActive = false;
+bool mpuInitialized = false;
+unsigned long lastMPUAttempt = 0;
+const unsigned long MPU_RETRY_INTERVAL = 5000; // Retry every 5 seconds
+
+
+// CAN Configuration
+static const twai_general_config_t canGeneralConfig = {
+   .mode = TWAI_MODE_NO_ACK,
+   .tx_io = TX_GPIO_NUM,
+   .rx_io = RX_GPIO_NUM,
+   .clkout_io = TWAI_IO_UNUSED,
+   .bus_off_io = TWAI_IO_UNUSED,
+   .tx_queue_len = 200,
+   .rx_queue_len = 10,
+   .alerts_enabled = TWAI_ALERT_ALL,
+   .clkout_divider = 0,
+   .intr_flags = ESP_INTR_FLAG_LEVEL1};
+
+
+// Methods
+void initializeWiFi(); // Unused in provided code, kept for completeness
+void initializeOTA();  // Unused in provided code, kept for completeness
+bool initializeCAN();
+void initializeCANMessages();
+void readSensorData();
+void readGPSData();
+void readMPUData();
+void prepareCANMessages();
+void prepareADCMessage();
+void prepareGPSMessage();
+void prepareAccelerometerMessage();
+void prepareGyroscopeMessage();
+void transmitCANMessages();
+bool restartCANDriver();
+void initializeI2C();
+bool initializeMPU();
+
+
+static const twai_timing_config_t canTimingConfig = TWAI_TIMING_CONFIG_500KBITS();
+static const twai_filter_config_t canFilterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
 
 void setup() {
+ if (vb) {
+   Serial.begin(115200);
+ }
+ Serial2.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+ Log.begin(LOG_LEVEL, &Serial); // Log always tries to print to Serial
 
-  Serial.begin(115200);
-  Serial2.begin(GPS_BAUDRATE);
-  Log.begin(LOG_LEVEL, &Serial);
-  
-  MPU.read();
+
+ initializeI2C();
+ initializeMPU();
+ initializeCAN();
+ initializeCANMessages();
 
 
-  status = can_driver_install(&g_config, &t_config, &f_config);
-  if (status == ESP_OK) {
-    Log.noticeln("Can driver installed");
-  } else {
-    Log.errorln("Can driver installation failed with error: %s", esp_err_to_name(status));
-  }
-
-  status = can_start();
-  if (status == ESP_OK) {
-    Log.noticeln("Can started");
-  } else {
-    Log.errorln("Can starting procedure failed with error: %s", esp_err_to_name(status));
-  }
-
-  // Inițializare mesaje CAN
-  tx_msg_mpu.data_length_code = 8;
-  tx_msg_mpu.identifier = 0x115;
-  tx_msg_mpu.flags = CAN_MSG_FLAG_NONE;
-
-  tx_msg_adc.data_length_code = 8;
-  tx_msg_adc.identifier = 0x116;
-  tx_msg_adc.flags = CAN_MSG_FLAG_NONE;
-
-  tx_msg_gps.data_length_code = 5;
-  tx_msg_gps.identifier = 0x117;
-  tx_msg_gps.flags = CAN_MSG_FLAG_NONE;
-
-  tx_msg_acc.data_length_code=6;
-  tx_msg_acc.identifier=0x118;
-  tx_msg_acc.flags=CAN_MSG_FLAG_NONE;
-
-  tx_msg_gyro.data_length_code=6;
-  tx_msg_gyro.identifier=0x119;
-  tx_msg_gyro.flags=CAN_MSG_FLAG_NONE;
-
+ if (vb) {
+   Log.noticeln("Telemetry system initialized");
+   Serial.println("\n------------------------------------");
+   Serial.println("  ESP32 Telemetry Module Initialized");
+   Serial.println("------------------------------------\n");
+ }
 }
+
 
 void loop() {
-  
-
-  dleft = damperLeftFront.getVoltage();
-  dright = damperRightFront.getVoltage();
-  dsteeringAngle = steeringAngle.getVoltage();
-
-  tx_msg_adc.data[0]=dleft/100;
-  tx_msg_adc.data[1]=dleft%100;
-  tx_msg_adc.data[2]=dright/100;  
-  tx_msg_adc.data[3]=dright%100; 
-  tx_msg_adc.data[4]=dsteeringAngle/100;
-  tx_msg_adc.data[5]=dsteeringAngle%100; 
+ static unsigned long lastYield = 0;
 
 
-  roll = MPU.getRoll();
-  pitch = MPU.getPitch();
-  yaw = MPU.getYaw();
-
-  tx_msg_mpu.data[6]=0;
-
-  if(roll >= 0) {
-    convert(roll, tx_msg_mpu.data);
-
-  }
-  else {
-    convert(roll*-1, tx_msg_mpu.data);
-    tx_msg_mpu.data[6]= tx_msg_mpu.data[6]+1; 
-  }
-
-  if(pitch >= 0) {
-    convert(pitch, tx_msg_mpu.data+2);
-  }
-  else {
-    convert(pitch*-1, tx_msg_mpu.data+2);
-    tx_msg_mpu.data[6]= tx_msg_mpu.data[6]+2; 
-  }
-
-  if(yaw >= 0) {
-    convert(yaw, tx_msg_mpu.data+4);
-  }
-  else {
-    convert(yaw*-1, tx_msg_mpu.data+4);
-    tx_msg_mpu.data[6]= tx_msg_mpu.data[6]+4; 
-  }
+ if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
+   readSensorData();
+   prepareCANMessages();
+   transmitCANMessages();
+   lastTelemetryTime = millis();
+ }
 
 
-  gx = MPU.currentData.gyroX;
-  gy = MPU.currentData.gyroY; 
-  gz = MPU.currentData.gyroZ;
-  convert(gx, tx_msg_gyro.data);
-  convert(gy, tx_msg_gyro.data+2);
-  convert(gz, tx_msg_gyro.data+4);
-
-  ax = MPU.currentData.accelX;
-  ay = MPU.currentData.accelY; 
-  az = MPU.currentData.accelZ;
-  convert(ax, tx_msg_acc.data);
-  convert(ay, tx_msg_acc.data+2);
-  convert(az, tx_msg_acc.data+4);
-
-  convert(MPU.currentData.accelX, tx_msg_acc.data);
-  convert(MPU.currentData.accelY, tx_msg_acc.data+2);
-  convert(MPU.currentData.accelZ, tx_msg_acc.data+4);
-
-  //gyro
-  convert(MPU.currentData.gyroX, tx_msg_gyro.data);
-  convert(MPU.currentData.gyroY, tx_msg_gyro.data+2);
-  convert(MPU.currentData.gyroZ, tx_msg_gyro.data+4);
-
-
-  if (Serial2.available() > 0) {
-    if (gps.encode(Serial2.read())) {
-      if (gps.location.isValid()) {
-        latitude = gps.location.lat();
-        longitude = gps.location.lng();
-      }
-      if (gps.speed.isValid()) {
-        speed = gps.speed.kmph();
-      }
-    }
-  }
-  tx_msg_gps.data[0] = double(latitude / 100);
-  tx_msg_gps.data[1] = double(latitude % 100);
-  tx_msg_gps.data[2] = double(longitude / 100);
-  tx_msg_gps.data[3] = double(longitude % 100);
-  tx_msg_gps.data[4] = uint8_t(speed);
-
-  status = can_transmit(&tx_msg_gps, pdMS_TO_TICKS(1000));
-  if (status == ESP_OK) {
-  } else {
-    Log.errorln("Can message sending failed with error code: %s ;\nRestarting CAN driver", esp_err_to_name(status));
-    can_stop();
-    can_driver_uninstall();
-    can_driver_install(&g_config, &t_config, &f_config);
-    status = can_start();
-    if (status == ESP_OK) Log.errorln("Can driver restarted");
-  }
-
- 
-  
-  status = can_transmit(&tx_msg_adc, pdMS_TO_TICKS(1000));
-  if (status == ESP_OK) {
-    //Log.noticeln("Can message ADC sent");
-  } else {
-    Log.errorln("Can message sending failed with error code: %s ;\nRestarting CAN driver", esp_err_to_name(status));
-    can_stop();
-    can_driver_uninstall();
-    can_driver_install(&g_config, &t_config, &f_config);
-    status = can_start();
-    if (status == ESP_OK) Log.errorln("Can driver restarted");
-  }
-  status = can_transmit(&tx_msg_mpu, pdMS_TO_TICKS(1000));
-   if(status==ESP_OK) {
-    Log.noticeln("Can message sent");
-  }
-  else {
-    Log.errorln("Can message sending failed with error code: %s ;\nRestarting CAN driver", esp_err_to_name(status));
-    can_stop();
-    can_driver_uninstall();
-    can_driver_install(&g_config, &t_config, &f_config);
-    status = can_start();
-    if(status==ESP_OK) Log.error("Can driver restarted");
-  }
-
-  status = can_transmit(&tx_msg_acc, pdMS_TO_TICKS(1000));
-   if(status==ESP_OK) {
-    Log.noticeln("Can message sent");
-  }
-  else {
-    Log.errorln("Can message sending failed with error code: %s ;\nRestarting CAN driver", esp_err_to_name(status));
-    can_stop();
-    can_driver_uninstall();
-    can_driver_install(&g_config, &t_config, &f_config);
-    status = can_start();
-    if(status==ESP_OK) Log.error("Can driver restarted");
-  }
-
-  status = can_transmit(&tx_msg_gyro, pdMS_TO_TICKS(1000));
-   if(status==ESP_OK) {
-    Log.noticeln("Can message sent");
-  }
-  else {
-    Log.errorln("Can message sending failed with error code: %s ;\nRestarting CAN driver", esp_err_to_name(status));
-    can_stop();
-    can_driver_uninstall();
-    can_driver_install(&g_config, &t_config, &f_config);
-    status = can_start();
-    if(status==ESP_OK) Log.error("Can driver restarted");
-  }
-  
-  
-  delay(800);  
+ if(vb)
+   delay(1750);
 }
+
+
+void initializeI2C() {
+ // Initialize I2C with specific pins
+ Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
+ Wire.setClock(400000); // 400kHz I2C speed
+ if (vb) {
+   Log.noticeln("I2C initialized on SDA:%d, SCL:%d", MPU_SDA_PIN, MPU_SCL_PIN);
+ }
+}
+
+
+bool initializeMPU() {
+ if (vb) {
+   Log.noticeln("Initializing MPU9250...");
+ }
+
+
+ int status = mpu.begin();
+ if (status < 0) {
+   if (vb) {
+     Log.errorln("MPU9250 initialization failed, status: %d", status);
+   }
+   mpuInitialized = false;
+   return false;
+ }
+
+
+ // Configure IMU
+ mpu.setAccelRange(MPU9250::ACCEL_RANGE_8G);
+ mpu.setGyroRange(MPU9250::GYRO_RANGE_500DPS);
+ mpu.setDlpfBandwidth(MPU9250::DLPF_BANDWIDTH_20HZ);
+ mpu.setSrd(19); // 50 Hz
+
+
+ // Quick gyro calibration (optional)
+ status = mpu.calibrateGyro();
+ if (status < 0) {
+   if (vb) {
+     Log.warningln("Gyroscope calibration failed");
+   }
+ }
+
+
+ mpuInitialized = true;
+ if (vb) {
+   Log.noticeln("MPU9250 initialized successfully");
+ }
+ return true;
+}
+
+
+bool initializeCAN() {
+ esp_err_t status = twai_driver_install(&canGeneralConfig, &canTimingConfig,
+                                        &canFilterConfig); // Changed to twai_driver_install
+ if (status != ESP_OK) {
+   if (vb) {
+     Log.errorln("CAN driver installation failed: %s", esp_err_to_name(status));
+   }
+   return false;
+ }
+
+
+ status = twai_start(); // Changed to twai_start
+ if (status != ESP_OK) {
+   if (vb) {
+     Log.errorln("CAN start failed: %s", esp_err_to_name(status));
+   }
+   twai_driver_uninstall(); // Changed to twai_driver_uninstall
+   return false;
+ }
+
+
+ canDriverActive = true;
+ canRestartAttempts = 0;
+ if (vb) {
+   Log.noticeln("CAN driver initialized successfully");
+ }
+ return true;
+}
+
+
+void initializeCANMessages() {
+ // ADC message (steering + dampers)
+ canMessages[1].flags = TWAI_MSG_FLAG_NONE; // Changed to TWAI_MSG_FLAG_NONE
+ canMessages[1].identifier = CAN_ID_ADC;
+ canMessages[1].data_length_code = 8;
+
+
+ // GPS message
+ canMessages[2].flags = TWAI_MSG_FLAG_NONE;
+ canMessages[2].identifier = CAN_ID_GPS;
+ canMessages[2].data_length_code = 8;
+
+
+ // Accelerometer message
+ canMessages[3].flags = TWAI_MSG_FLAG_NONE;
+ canMessages[3].identifier = CAN_ID_MPU_ACCEL; // Renamed ID
+ canMessages[3].data_length_code = 6;
+
+
+ // Gyroscope message
+ canMessages[4].flags = TWAI_MSG_FLAG_NONE;
+ canMessages[4].identifier = CAN_ID_MPU_GYRO; // Renamed ID
+ canMessages[4].data_length_code = 6;
+
+
+ // Initialize all data arrays to zero
+ for (int i = 1; i < 5; i++) {
+   memset(canMessages[i].data, 0, sizeof(canMessages[i].data));
+ }
+}
+
+
+void readSensorData() {
+ // Read MPU
+ readMPUData();
+
+
+ // ADC readings
+ //sensorData.damperLeftVoltage = damperLeftFront.getVoltage();
+ //sensorData.damperRightVoltage = damperRightFront.getVoltage();
+ //sensorData.steeringAngleVoltage = steeringAngle.getVoltage();
+
+
+ // GPS data
+ readGPSData();
+
+
+ if (vb) {
+   Serial.println("\n--- Sensor Data Read ---");
+   Serial.printf("  Steering Angle: %u mV\n", sensorData.steeringAngleVoltage);
+   Serial.printf("  Damper Left: %u mV\n", sensorData.damperLeftVoltage);
+   Serial.printf("  Damper Right: %u mV\n", sensorData.damperRightVoltage);
+   Serial.printf("  Accel (X,Y,Z): %.2f, %.2f, %.2f m/s²\n",
+                 sensorData.accelX, sensorData.accelY, sensorData.accelZ);
+   Serial.printf("  Gyro (X,Y,Z): %.2f, %.2f, %.2f rad/s\n",
+                 sensorData.gyroX, sensorData.gyroY, sensorData.gyroZ);
+   if (sensorData.gpsValid) {
+     Serial.printf("  GPS Location: Lat %.6f, Lon %.6f\n",
+                   sensorData.latitude, sensorData.longitude);
+     Serial.printf("  GPS Speed: %.1f km/h\n", sensorData.speedKmh);
+   } else {
+     Serial.println("  GPS Data: Invalid/No Fix");
+   }
+ }
+}
+
+
+void readMPUData() {
+ if (!mpuInitialized) {
+   if (millis() - lastMPUAttempt > MPU_RETRY_INTERVAL) {
+     if (vb) {
+       Log.warningln("Attempting to reinitialize MPU9250...");
+     }
+     if (initializeMPU()) {
+       mpuInitialized = true;
+     }
+     lastMPUAttempt = millis();
+   }
+
+
+   // Set default values when MPU is not available
+   // Only memset parts relevant to IMU data, not the whole struct
+   sensorData.accelX = 0;
+   sensorData.accelY = 0;
+   sensorData.accelZ = 0;
+   sensorData.gyroX = 0;
+   sensorData.gyroY = 0;
+   sensorData.gyroZ = 0;
+   return;
+ }
+
+
+ // Add a small delay to prevent I2C bus flooding
+ static unsigned long lastMPURead = 0;
+ if (millis() - lastMPURead < 10) { // Minimum 10ms between reads
+   return;
+ }
+ lastMPURead = millis();
+
+
+ mpu.readSensor();
+
+
+ // Update sensor data
+ sensorData.accelX = mpu.getAccelX_mss();
+ sensorData.accelY = mpu.getAccelY_mss();
+ sensorData.accelZ = mpu.getAccelZ_mss();
+
+
+ // Get gyroscope data (rad/s)
+ sensorData.gyroX = mpu.getGyroX_rads();
+ sensorData.gyroY = mpu.getGyroY_rads();
+ sensorData.gyroZ = mpu.getGyroZ_rads();
+}
+
+
+void readGPSData() {
+ sensorData.gpsValid = false; // Assume invalid until proven otherwise
+
+
+ while (Serial2.available() > 0) {
+   if (gps.encode(Serial2.read())) {
+     if (gps.location.isValid()) {
+       sensorData.latitude = gps.location.lat();
+       sensorData.longitude = gps.location.lng();
+       sensorData.gpsValid = true;
+     }
+     if (gps.speed.isValid()) {
+       sensorData.speedKmh = gps.speed.kmph();
+     }
+   }
+ }
+}
+
+
+void prepareCANMessages() {
+ // MPU message with improved sign handling (removed this, using separate accel/gyro)
+ // prepareIMUMessage(); // This function is now unused
+
+
+ // ADC message
+ prepareADCMessage();
+
+
+ // GPS message with proper precision
+ prepareGPSMessage();
+
+
+ // Accelerometer message
+ prepareAccelerometerMessage();
+
+
+ // Gyroscope message
+ prepareGyroscopeMessage();
+}
+
+
+
+
+void prepareADCMessage() {
+ canMessages[1].data[0] = sensorData.damperLeftVoltage / 100;
+ canMessages[1].data[1] = sensorData.damperLeftVoltage % 100;
+ canMessages[1].data[2] = sensorData.damperRightVoltage / 100;
+ canMessages[1].data[3] = sensorData.damperRightVoltage % 100;
+ canMessages[1].data[4] = sensorData.steeringAngleVoltage / 100;
+ canMessages[1].data[5] = sensorData.steeringAngleVoltage % 100;
+ canMessages[1].data[6] = 0; // Reserved
+ canMessages[1].data[7] = 0; // Reserved
+}
+
+
+void prepareGPSMessage() {
+ // Pack GPS data with proper precision (multiply by 1000000 for 6 decimal places)
+ int32_t latInt = (int32_t)((sensorData.latitude - 47) * 1000000);
+ int32_t lonInt = (int32_t)((sensorData.longitude - 27) * 1000000);
+
+
+ canMessages[2].data[0] = (latInt >> 16) & 0xFF;
+ canMessages[2].data[1] = (latInt >> 8) & 0xFF;
+ canMessages[2].data[2] = latInt & 0xFF;
+ canMessages[2].data[3] = (lonInt >> 16) & 0xFF;
+ canMessages[2].data[4] = (lonInt >> 8) & 0xFF;
+ canMessages[2].data[5] = lonInt & 0xFF;
+ canMessages[2].data[6] = sensorData.speedKmh;
+}
+
+
+void prepareAccelerometerMessage() {
+ // Assuming `convert` function exists in aditional.hpp and handles float to 2-byte conversion
+ convert(sensorData.accelX, canMessages[3].data);
+ convert(sensorData.accelY, canMessages[3].data + 2);
+ convert(sensorData.accelZ, canMessages[3].data + 4);
+}
+
+
+void prepareGyroscopeMessage() {
+ // Assuming `convert` function exists in aditional.hpp and handles float to 2-byte conversion
+ convert(sensorData.gyroX, canMessages[4].data);
+ convert(sensorData.gyroY, canMessages[4].data + 2);
+ convert(sensorData.gyroZ, canMessages[4].data + 4);
+}
+
+
+void transmitCANMessages() {
+ if (!canDriverActive) {
+   if (vb) {
+     Serial.println("CAN driver inactive - skipping transmission");
+   }
+   return;
+ }
+
+
+ if (vb) {
+   Serial.println("\n--- Transmitting CAN Messages ---");
+ }
+
+
+ const char *messageNames[] = {"N/A", "ADC", "GPS", "ACCEL", "GYRO"}; // Corrected for 1-based indexing
+
+
+ for (int i = 1; i < 5; i++) {
+   esp_err_t status =
+       twai_transmit(&canMessages[i],
+                     pdMS_TO_TICKS(CAN_TIMEOUT_MS)); // Changed to twai_transmit
+
+
+   if (vb) {
+     Serial.printf("  TX %s [ID:0x%03X] [DLC:%d] Data: ", messageNames[i],
+                   canMessages[i].identifier, canMessages[i].data_length_code);
+
+
+     // Print data bytes in hex
+     for (int j = 0; j < canMessages[i].data_length_code; j++) {
+       Serial.printf("%02X ", canMessages[i].data[j]);
+     }
+
+
+     // Print decoded data for readability
+     Serial.print(" | Decoded: ");
+     switch (i) {
+       case 1: // ADC
+         Serial.printf("Steering:%u mV, DamperL:%u mV, DamperR:%u mV",
+                       sensorData.steeringAngleVoltage,
+                       sensorData.damperLeftVoltage,
+                       sensorData.damperRightVoltage);
+         break;
+
+
+       case 2: // GPS
+         if (sensorData.gpsValid) {
+           Serial.printf("Lat:%.6f, Lon:%.6f, Speed:%.1f km/h",
+                         sensorData.latitude, sensorData.longitude,
+                         sensorData.speedKmh);
+         } else {
+           Serial.print("GPS Invalid");
+         }
+         break;
+
+
+       case 3: // ACCEL
+         Serial.printf("Accel X:%.2f, Y:%.2f, Z:%.2f m/s²",
+                       sensorData.accelX, sensorData.accelY,
+                       sensorData.accelZ);
+         break;
+
+
+       case 4: // GYRO
+         Serial.printf("Gyro X:%.2f, Y:%.2f, Z:%.2f rad/s",
+                       sensorData.gyroX, sensorData.gyroY, sensorData.gyroZ);
+         break;
+     }
+
+
+     if (status == ESP_OK) {
+       Serial.println(" (SENT)");
+     } else {
+       Serial.printf(" (FAILED: %s)\n", esp_err_to_name(status));
+       Log.errorln("CAN %s message failed: %s", messageNames[i],
+                   esp_err_to_name(status));
+
+
+       if (!restartCANDriver()) {
+         if (vb) {
+           Log.errorln("CAN driver restart failed - disabling CAN transmission");
+         }
+         canDriverActive = false;
+         return;
+       }
+     }
+   } else { // if vb is false, still try to transmit and log errors
+     if (status != ESP_OK) {
+       Log.errorln("CAN %s message failed: %s", messageNames[i], esp_err_to_name(status));
+       if (!restartCANDriver()) {
+         canDriverActive = false;
+         return;
+       }
+     }
+   }
+ }
+ if (vb) {
+   Serial.println("-----------------------------\n");
+ }
+}
+
+
+bool restartCANDriver() {
+ if (canRestartAttempts >= MAX_CAN_RESTART_ATTEMPTS) {
+   if (vb) {
+     Log.errorln("Maximum CAN restart attempts reached");
+   }
+   return false;
+ }
+
+
+ canRestartAttempts++;
+ if (vb) {
+   Log.warningln("Attempting CAN driver restart (attempt %d/%d)",
+                 canRestartAttempts, MAX_CAN_RESTART_ATTEMPTS);
+ }
+
+
+ // Stop and uninstall current driver
+ twai_stop();          // Changed to twai_stop
+ twai_driver_uninstall(); // Changed to twai_driver_uninstall
+
+
+ // Reinitialize
+ if (initializeCAN()) {
+   if (vb) {
+     Log.noticeln("CAN driver restarted successfully");
+   }
+   return true;
+ }
+
+
+ return false;
+}
+
